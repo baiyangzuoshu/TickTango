@@ -2,7 +2,11 @@ import { Tick, InputPayload } from "../Types";
 
 type TickListener = (t: Tick, bundle: Record<number, InputPayload>) => void;
 type WelcomeListener = (data: {
-  playerId: number; tps: number; tick: number; inputLead: number; simDelay: number;
+  playerId: number;
+  tps: number;
+  tick: number;
+  inputLead: number;
+  simDelay: number;
 }) => void;
 
 export class Net {
@@ -32,7 +36,11 @@ export class Net {
 
       ws.onmessage = (ev) => {
         let msg: any;
-        try { msg = JSON.parse(ev.data); } catch { return; }
+        try {
+          msg = JSON.parse(ev.data);
+        } catch {
+          return;
+        }
 
         if (msg.type === "welcome") {
           this.playerId = msg.playerId;
@@ -45,7 +53,7 @@ export class Net {
             tps: this.tps,
             tick: this.serverTick,
             inputLead: this.inputLead,
-            simDelay: this.simDelay
+            simDelay: this.simDelay,
           });
         }
 
@@ -61,8 +69,12 @@ export class Net {
     });
   }
 
-  onWelcome(cb: WelcomeListener) { this.onWelcomeCb = cb; }
-  onTick(cb: TickListener) { this.onTickCb = cb; }
+  onWelcome(cb: WelcomeListener) {
+    this.onWelcomeCb = cb;
+  }
+  onTick(cb: TickListener) {
+    this.onTickCb = cb;
+  }
 
   // 在收到服务器 tick T 时，发送我们对 (T + inputLead) 的输入（每 tick 仅一次）
   sendInputForUpcomingTick(upcomingTick: Tick, input: InputPayload) {

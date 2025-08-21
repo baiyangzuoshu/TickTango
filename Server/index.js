@@ -1,9 +1,9 @@
 import { WebSocketServer } from "ws";
 
-const TPS = 30;                 // 服务器 tick 率
+const TPS = 30; // 服务器 tick 率
 const TICK_MS = 1000 / TPS;
-const INPUT_LEAD = 2;           // 建议输入超前 2 tick
-const SIM_DELAY = 2;            // 客户端建议延迟 2 tick 消化
+const INPUT_LEAD = 2; // 建议输入超前 2 tick
+const SIM_DELAY = 2; // 客户端建议延迟 2 tick 消化
 
 const wss = new WebSocketServer({ port: 8080 });
 console.log("[server] ws://localhost:8080");
@@ -23,27 +23,38 @@ wss.on("connection", (ws) => {
   players.set(playerId, { ws, lastInput: { ax: 0 } });
 
   // 欢迎包：告知 tps、当前 tick、推荐缓冲
-  ws.send(JSON.stringify({
-    type: "welcome",
-    playerId,
-    tps: TPS,
-    tick,
-    inputLead: INPUT_LEAD,
-    simDelay: SIM_DELAY
-  }));
+  ws.send(
+    JSON.stringify({
+      type: "welcome",
+      playerId,
+      tps: TPS,
+      tick,
+      inputLead: INPUT_LEAD,
+      simDelay: SIM_DELAY,
+    })
+  );
 
   ws.on("message", (raw) => {
     let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      return;
+    }
 
     if (msg.type === "input") {
       const t = msg.tick | 0;
       // 兜底域校验：ax ∈ {-1,0,1}
-      const ax = Math.max(-1, Math.min(1, (msg.input?.ax | 0)));
+      const ax = Math.max(-1, Math.min(1, msg.input?.ax | 0));
+
       if (!pendingInputs.has(t)) pendingInputs.set(t, new Map());
+
       pendingInputs.get(t).set(playerId, { ax });
+
       const p = players.get(playerId);
+
       if (p) p.lastInput = { ax };
+
       return;
     }
 
@@ -61,7 +72,9 @@ wss.on("connection", (ws) => {
 function broadcast(obj) {
   const text = JSON.stringify(obj);
   for (const { ws } of players.values()) {
-    try { ws.send(text); } catch {}
+    try {
+      ws.send(text);
+    } catch {}
   }
 }
 

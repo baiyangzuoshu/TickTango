@@ -1,13 +1,26 @@
-import { _decorator, Component, Node, Color, UITransform, Vec3, Label, director, input, Input, EventKeyboard, KeyCode } from "cc";
+import {
+  _decorator,
+  Component,
+  Node,
+  Color,
+  UITransform,
+  Vec3,
+  Label,
+  input,
+  Input,
+  EventKeyboard,
+  KeyCode,
+} from "cc";
 import { InputPayload, PlayerState, Tick } from "./Types";
 import { Net } from "./Net/NetManager";
 
 const { ccclass, property } = _decorator;
 
 // ----------------- 可调参数 -----------------
-const STEP = 1 / 30;                   // 固定步（与服务器 TPS 一致）
-const SPEED_1000 = 240 * 1000;         // 像素/秒 * 放大 1000
-const WORLD_MIN_X = 50, WORLD_MAX_X = 1230;
+const STEP = 1 / 30; // 固定步（与服务器 TPS 一致）
+const SPEED_1000 = 240 * 1000; // 像素/秒 * 放大 1000
+const WORLD_MIN_X = 50,
+  WORLD_MAX_X = 1230;
 // 渲染缩放：定点 -> 实像素
 const FX = (x1000: number) => Math.round(x1000 / 1000);
 
@@ -17,17 +30,17 @@ const FX = (x1000: number) => Math.round(x1000 / 1000);
 export class Game extends Component {
   private net = new Net("ws://localhost:8080");
 
-  private acc = 0;                // 累加器
-  private simTick: Tick = 0;      // 已经模拟到的 tick
+  private acc = 0; // 累加器
+  private simTick: Tick = 0; // 已经模拟到的 tick
   private latestServerTick = 0;
 
   private playerId = 0;
 
-  private nodes = new Map<number, Node>();    // playerId -> Node
+  private nodes = new Map<number, Node>(); // playerId -> Node
   private states = new Map<number, PlayerState>(); // playerId -> 状态
   private tickBuffer = new Map<Tick, Record<number, InputPayload>>(); // 收到但未消费的输入包
 
-  private currentAx = 0;          // 本地玩家当前输入（-1/0/1）
+  private currentAx = 0; // 本地玩家当前输入（-1/0/1）
 
   private hud?: Node;
   private infoLabel?: Label;
@@ -48,7 +61,8 @@ export class Game extends Component {
       this.playerId = playerId;
       this.simTick = 0;
       this.latestServerTick = tick;
-      if (this.infoLabel) this.infoLabel.string = `player=${playerId} tick=${tick} lead=${inputLead} delay=${simDelay}`;
+      if (this.infoLabel)
+        this.infoLabel.string = `player=${playerId} tick=${tick} lead=${inputLead} delay=${simDelay}`;
       // 本地创建自己的实体
       this.ensurePlayerNode(playerId, true);
     });
@@ -58,7 +72,9 @@ export class Game extends Component {
       this.latestServerTick = t;
       this.tickBuffer.set(t, bundle);
       // 针对 (t + inputLead) 发送一次我们的输入
-      this.net.sendInputForUpcomingTick(t + this.net.inputLead, { ax: this.currentAx });
+      this.net.sendInputForUpcomingTick(t + this.net.inputLead, {
+        ax: this.currentAx,
+      });
     });
   }
 
@@ -130,7 +146,11 @@ export class Game extends Component {
 
   private ensurePlayerNode(playerId: number, mine: boolean) {
     if (this.states.has(playerId)) return;
-    const st: PlayerState = { id: playerId, x1000: mine ? 300000 : 900000, vx1000: 0 };
+    const st: PlayerState = {
+      id: playerId,
+      x1000: mine ? 300000 : 900000,
+      vx1000: 0,
+    };
     this.states.set(playerId, st);
 
     const n = new Node(`P${playerId}`);
