@@ -1,38 +1,70 @@
 import { WebSocketServer } from "ws";
-
-const TPS = 30; // 服务器 tick 率
-const TICK_MS = 1000 / TPS;
-const INPUT_LEAD = 2; // 建议输入超前 2 tick
-const SIM_DELAY = 2; // 客户端建议延迟 2 tick 消化
+import crypto from "crypto";
 
 const wss = new WebSocketServer({ port: 8080 });
-console.log("[server] ws://localhost:8080");
 
-let tick = 0;
-let nextPlayerId = 1;
-let nextTickAt = Date.now() + TICK_MS;
+const TICK_RATE = 20;
+const TICK_MS = 1000 / TICK_RATE;
 
-// 玩家表：playerId -> { ws, lastInput:{ax} }
-const players = new Map();
+class Room {
+  constructor(id) {
+    this.id = id;
+    this.players = new Map();
+    this.tick = 0;
+    this.inputDelay = 3;
+    this.seed = crypto.randomBytes(4).readUInt32BE(0);
+    this.buffer = new Map();
+    this.timer = null;
+  }
+  addPlayer(ws) {
+    const pid = this.players.size + 1;
+    this.players.set(ws, { id: pid });
+    ws.send(
+      JSON.stringify({
+        type: "start",
+        roomId: this.id,
+        playerId: pid,
+        tickRate: TICK_RATE,
+        inputDelay: this.inputDelay,
+        seed: this.seed,
+      })
+    );
+    if (this.players.size === 2 && !this.timer) this.start();
+  }
+  start() {
+    this.timer = setInterval(() => {
+      this.tick++;
+      const cmds = [];
+      for (const [ws, { id: pid }] of this.players) {
+        const byTick = this.buffer.get(this.tick) || new Map();
+        const list = byTick.get(pid) || [];
+        if (list.length === 0) cmds.push({ pid, cmd: { kind: "noop" } });
+        else list.forEach((cmd) => cmds.push({ pid, cmd }));
+      }
+      const frame = { type: "frame", roomId: this.id, tick: this.tick, cmds };
+      const text = JSON.stringify(frame);
+      for (const ws of this.players.keys()) {
+        if (ws.readyState === ws.OPEN) ws.send(text);
+      }
+      this.buffer.delete(this.tick - 10);
+    }, TICK_MS);
+  }
+  pushInput(pid, tick, cmd) {
+    if (tick < this.tick) return;
+    if (!this.buffer.has(tick)) this.buffer.set(tick, new Map());
+    const byTick = this.buffer.get(tick);
+    if (!byTick.has(pid)) byTick.set(pid, []);
+    byTick.get(pid).push(cmd);
+  }
+  close() {
+    if (this.timer) clearInterval(this.timer);
+  }
+}
 
-// 待执行输入：tick -> Map<playerId, {ax}>
-const pendingInputs = new Map();
+const room = new Room("r1");
 
 wss.on("connection", (ws) => {
-  const playerId = nextPlayerId++;
-  players.set(playerId, { ws, lastInput: { ax: 0 } });
-
-  // 欢迎包：告知 tps、当前 tick、推荐缓冲
-  ws.send(
-    JSON.stringify({
-      type: "welcome",
-      playerId,
-      tps: TPS,
-      tick,
-      inputLead: INPUT_LEAD,
-      simDelay: SIM_DELAY,
-    })
-  );
+  room.addPlayer(ws);
 
   ws.on("message", (raw) => {
     let msg;
@@ -41,68 +73,19 @@ wss.on("connection", (ws) => {
     } catch {
       return;
     }
-
     if (msg.type === "input") {
-      const t = msg.tick | 0;
-      // 兜底域校验：ax ∈ {-1,0,1}
-      const ax = Math.max(-1, Math.min(1, msg.input?.ax | 0));
-
-      if (!pendingInputs.has(t)) pendingInputs.set(t, new Map());
-
-      pendingInputs.get(t).set(playerId, { ax });
-
-      const p = players.get(playerId);
-
-      if (p) p.lastInput = { ax };
-
-      return;
-    }
-
-    if (msg.type === "ping") {
-      ws.send(JSON.stringify({ type: "pong", time: msg.time, tick }));
-      return;
+      const player = room.players.get(ws);
+      if (!player) return;
+      room.pushInput(player.id, msg.tick, msg.cmd);
+    } else if (msg.type === "ping") {
+      ws.send(JSON.stringify({ type: "pong", t: msg.t }));
     }
   });
 
   ws.on("close", () => {
-    players.delete(playerId);
+    room.players.delete(ws);
+    if (room.players.size === 0) room.close();
   });
 });
 
-function broadcast(obj) {
-  const text = JSON.stringify(obj);
-  for (const { ws } of players.values()) {
-    try {
-      ws.send(text);
-    } catch {}
-  }
-}
-
-function tickLoop() {
-  const now = Date.now();
-
-  if (now >= nextTickAt) {
-    tick++;
-
-    // 聚合本 tick 的每个玩家输入（无则沿用 lastInput，默认 0）
-    const bundle = {};
-    for (const [pid, p] of players.entries()) {
-      const inpMap = pendingInputs.get(tick);
-      const got = inpMap?.get(pid);
-      const input = got ?? p.lastInput ?? { ax: 0 };
-      bundle[pid] = input;
-      p.lastInput = input;
-    }
-    pendingInputs.delete(tick);
-
-    // 广播：本 tick 的输入集
-    broadcast({ type: "tick", tick, inputs: bundle });
-
-    // 漂移修正（不丢 tick）
-    while (now >= nextTickAt) nextTickAt += TICK_MS;
-  }
-
-  setTimeout(tickLoop, Math.max(0, nextTickAt - Date.now() - 1));
-}
-
-tickLoop();
+console.log("ws://localhost:8080 ready");
