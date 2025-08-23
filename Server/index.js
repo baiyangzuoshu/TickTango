@@ -1,91 +1,45 @@
-import { WebSocketServer } from "ws";
-import crypto from "crypto";
+// ESM 版本
+import WebSocket, { WebSocketServer } from "ws";
+
+const TICK_MS = 50; // 20 FPS
+let tick = 0; // 服务器权威帧号
 
 const wss = new WebSocketServer({ port: 8080 });
+console.log("WS server on ws://localhost:8080");
 
-const TICK_RATE = 20;
-const TICK_MS = 1000 / TICK_RATE;
+const inputsPerTick = new Map(); // tick -> [{pid, input}]
+let nextPlayerId = 1;
 
-class Room {
-  constructor(id) {
-    this.id = id;
-    this.players = new Map();
-    this.tick = 0;
-    this.inputDelay = 3;
-    this.seed = crypto.randomBytes(4).readUInt32BE(0);
-    this.buffer = new Map();
-    this.timer = null;
-  }
-  addPlayer(ws) {
-    const pid = this.players.size + 1;
-    this.players.set(ws, { id: pid });
-    ws.send(
-      JSON.stringify({
-        type: "start",
-        roomId: this.id,
-        playerId: pid,
-        tickRate: TICK_RATE,
-        inputDelay: this.inputDelay,
-        seed: this.seed,
-      })
-    );
-    if (this.players.size === 2 && !this.timer) this.start();
-  }
-  start() {
-    this.timer = setInterval(() => {
-      this.tick++;
-      const cmds = [];
-      for (const [ws, { id: pid }] of this.players) {
-        const byTick = this.buffer.get(this.tick) || new Map();
-        const list = byTick.get(pid) || [];
-        if (list.length === 0) cmds.push({ pid, cmd: { kind: "noop" } });
-        else list.forEach((cmd) => cmds.push({ pid, cmd }));
-      }
-      const frame = { type: "frame", roomId: this.id, tick: this.tick, cmds };
-      const text = JSON.stringify(frame);
-      for (const ws of this.players.keys()) {
-        if (ws.readyState === ws.OPEN) ws.send(text);
-      }
-      this.buffer.delete(this.tick - 10);
-    }, TICK_MS);
-  }
-  pushInput(pid, tick, cmd) {
-    if (tick < this.tick) return;
-    if (!this.buffer.has(tick)) this.buffer.set(tick, new Map());
-    const byTick = this.buffer.get(tick);
-    if (!byTick.has(pid)) byTick.set(pid, []);
-    byTick.get(pid).push(cmd);
-  }
-  close() {
-    if (this.timer) clearInterval(this.timer);
+function broadcast(obj) {
+  const msg = JSON.stringify(obj);
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
   }
 }
 
-const room = new Room("r1");
-
 wss.on("connection", (ws) => {
-  room.addPlayer(ws);
+  const pid = nextPlayerId++;
+  ws.send(JSON.stringify({ type: "hello", pid })); // 分配玩家 id
 
-  ws.on("message", (raw) => {
+  ws.on("message", (data) => {
     let msg;
     try {
-      msg = JSON.parse(raw);
+      msg = JSON.parse(data.toString());
     } catch {
       return;
     }
-    if (msg.type === "input") {
-      const player = room.players.get(ws);
-      if (!player) return;
-      room.pushInput(player.id, msg.tick, msg.cmd);
-    } else if (msg.type === "ping") {
-      ws.send(JSON.stringify({ type: "pong", t: msg.t }));
+    //console.log("ws message", msg);
+    if (msg.type === "input" && typeof msg.clientTick === "number") {
+      const list = inputsPerTick.get(msg.clientTick) || [];
+      list.push({ pid, input: msg.input });
+      inputsPerTick.set(msg.clientTick, list);
     }
-  });
-
-  ws.on("close", () => {
-    room.players.delete(ws);
-    if (room.players.size === 0) room.close();
   });
 });
 
-console.log("ws://localhost:8080 ready");
+setInterval(() => {
+  tick++;
+  const bundle = inputsPerTick.get(tick) || [];
+  inputsPerTick.delete(tick);
+  broadcast({ type: "tick", tick, inputs: bundle });
+}, TICK_MS);

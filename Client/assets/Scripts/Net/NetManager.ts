@@ -26,6 +26,7 @@ export class Net {
   }
 
   sendInput(roomId: string, tick: number, cmd: Cmd) {
+    console.log("sendInput", roomId, tick, cmd);
     this.ws?.readyState === this.ws.OPEN &&
       this.ws.send(JSON.stringify({ type: "input", roomId, tick, cmd }));
   }
