@@ -17,17 +17,16 @@ type InputVec = { x: number; y: number };
 type InputTable = Record<string, InputVec>; // pid(string) -> {x,y}
 type StateTable = Record<string, { x: number; y: number }>;
 
-type GameEvent = {
-  kind: "damage";
-  tick: number;
-  target: string;
-  amount: number;
-  id: string;
-};
+type GameEvent =
+  | { kind: "damage"; tick: number; target: string; amount: number; id: string }
+  | { kind: "pickup"; tick: number; pid: string; itemId: string; id: string };
+
+type Item = { id: string; x: number; y: number; r: number; alive: boolean };
 
 @ccclass("FrameSyncClient")
 export class FrameSyncClient extends Component {
   @property(Node) boxTemplate: Node | null = null;
+  @property(Node) itemTemplate: Node | null = null; // 可选：用于显示宝物
 
   // --- WS & 自身 ---
   private ws!: WebSocket;
@@ -53,20 +52,43 @@ export class FrameSyncClient extends Component {
   private predictedTicks = new Set<number>();
 
   // --- 状态（纯数据） + 场景节点 ---
-  private currentState: StateTable = {}; // 正在使用的状态
+  private currentState: StateTable = {}; // 正在使用的状态（玩家位置 + hp/score等扩展键）
   private stateByTick: { [tick: number]: StateTable } = {}; // 每帧后的状态快照（回滚/追帧基线）
   private players = new Map<number, Node>(); // pid:number -> Node
   private readonly STEP_PIXELS = 8; // 每帧移动像素
 
-  // --- 事件系统（掉血/毒圈） ---
+  // --- 事件系统（掉血 & 捡宝物） ---
   private eventsByTick: { [tick: number]: GameEvent[] } = Object.create(null);
   private fxMuteDuringCatchup = true; // 追帧时压缩/静默表现
+
+  // 毒圈（示例）
   private dangerZones = [
-    { x: -220, y: 0, r: 60, damage: 5 }, // 示例毒圈：每帧 -5 HP（10Hz≈每秒 -50）
+    { x: -220, y: 0, r: 60, damage: 5 }, // 每帧 -5 HP（10Hz≈每秒 -50）
   ];
+
+  // 宝物（确定性：固定初始配置）
+  private readonly initialItemsSeed: Item[] = [
+    { id: "gem1", x: -80, y: 60, r: 28, alive: true },
+    { id: "gem2", x: 0, y: 0, r: 28, alive: true },
+    { id: "gem3", x: 120, y: -40, r: 28, alive: true },
+  ];
+  private items: Item[] = []; // 当前帧的宝物状态
+  private itemsByTick: { [tick: number]: Item[] } = Object.create(null); // 每帧的宝物状态快照
+  private itemNodes = new Map<string, Node>(); // 可选：用于显示宝物
 
   onLoad() {
     this.inputsByTick = Object.create(null);
+    this.items = this.cloneItems(this.initialItemsSeed); // 初始化宝物
+
+    // （可选）创建宝物节点
+    if (this.itemTemplate) {
+      for (const it of this.items) {
+        const n = instantiate(this.itemTemplate);
+        n.setParent(this.node);
+        n.setPosition(new Vec3(it.x, it.y, 0));
+        this.itemNodes.set(it.id, n);
+      }
+    }
 
     // 连接服务器
     this.ws = new WebSocket("ws://localhost:8080");
@@ -96,12 +118,13 @@ export class FrameSyncClient extends Component {
           this.synced = true;
           this.acc = 0;
           this.stateByTick[this.localTick] = this.cloneState(this.currentState);
+          this.itemsByTick[this.localTick] = this.cloneItems(this.items);
           console.log(
             `Synced: server t=${t}, localTick=${this.localTick}, delay=${this.PLAYBACK_DELAY}`
           );
         }
 
-        // 3) 若该帧曾预测且与权威不同 → 回滚
+        // 3) 若该帧曾预测且与权威不同 → 回滚（输入差异才需要回滚）
         if (this.predictedTicks.has(t)) {
           const predicted = this.usedInputsByTick[t] || {};
           if (!this.sameInputTable(predicted, table)) {
@@ -179,9 +202,6 @@ export class FrameSyncClient extends Component {
     this.renderFromState();
     if (!catchingUp || !this.fxMuteDuringCatchup) {
       this.playFxForTick(this.localTick, /*compressed=*/ catchingUp);
-    } else {
-      // 追帧中，压缩表现：只打印一行简报（可选）
-      // this.playFxForTick(this.localTick, true);
     }
 
     // 清理老快照，保留最近 2000 帧（回滚/追帧需要）
@@ -194,6 +214,8 @@ export class FrameSyncClient extends Component {
       if (+k < keep) delete this.stateByTick[+k];
     for (const k of Object.keys(this.eventsByTick))
       if (+k < keep) delete this.eventsByTick[+k];
+    for (const k of Object.keys(this.itemsByTick))
+      if (+k < keep) delete this.itemsByTick[+k];
   }
 
   // 把“取权威/预测并推进”的逻辑抽出来，常规/追帧都复用
@@ -233,7 +255,7 @@ export class FrameSyncClient extends Component {
     return table;
   }
 
-  // ==== 推进一帧（纯数据 + 事件） ====
+  // ==== 推进一帧（纯数据 + 事件 + 宝物） ====
   private stepOneTick(tick: number, table: InputTable) {
     const nextState = this.cloneState(this.currentState);
     const step = this.STEP_PIXELS;
@@ -254,10 +276,12 @@ export class FrameSyncClient extends Component {
       p.y += step * (dir.y || 0);
     }
 
-    // B) 事件：毒圈掉血（确定性）
+    // === 事件列表（本帧产出） ===
     const evs: GameEvent[] = [];
+
+    // B) 毒圈掉血（确定性）
     for (const [pid, pos] of Object.entries(nextState)) {
-      if (pid.startsWith("hp:")) continue; // 跳过 HP 键
+      if (pid.startsWith("hp:") || pid.startsWith("score:")) continue; // 跳过扩展键
       for (const dz of this.dangerZones) {
         const dx = pos.x - dz.x,
           dy = pos.y - dz.y;
@@ -279,29 +303,68 @@ export class FrameSyncClient extends Component {
       }
     }
 
-    // 保存事件 & 状态快照（用于回滚/追帧）
+    // C) 捡宝物（确定性：同帧重叠 → pid 最小者拾取）
+    for (const item of this.items) {
+      if (!item.alive) continue;
+      const contenders: string[] = [];
+
+      for (const [pid, pos] of Object.entries(nextState)) {
+        if (pid.startsWith("hp:") || pid.startsWith("score:")) continue;
+        const dx = pos.x - item.x,
+          dy = pos.y - item.y;
+        if (dx * dx + dy * dy <= item.r * item.r) {
+          contenders.push(pid);
+        }
+      }
+
+      if (contenders.length) {
+        contenders.sort((a, b) => Number(a) - Number(b)); // 决定性平手规则
+        const winner = contenders[0];
+
+        // 更新宝物状态（被捡走）
+        item.alive = false;
+
+        // 产出事件
+        const id = `pickup:${tick}:${winner}:${item.id}`;
+        evs.push({ kind: "pickup", tick, pid: winner, itemId: item.id, id });
+
+        // 写入分数（示例：+1）
+        const scKey = `score:${winner}`;
+        (nextState as any)[scKey] = ((nextState as any)[scKey] ?? 0) + 1;
+      }
+    }
+
+    // 存事件、状态快照、宝物快照（用于回滚/追帧）
     this.eventsByTick[tick] = evs;
     this.currentState = nextState;
     this.stateByTick[tick] = this.cloneState(this.currentState);
+    this.itemsByTick[tick] = this.cloneItems(this.items);
   }
 
-  // ==== 回滚 ====
+  // ==== 回滚（状态 + 宝物一起还原并重算） ====
   private rollbackFrom(tStart: number) {
     const baseTick = tStart - 1;
+
     const baseState = this.stateByTick[baseTick]
       ? this.cloneState(this.stateByTick[baseTick])
       : this.cloneState(this.initialState());
-
     this.currentState = baseState;
 
-    // 用“权威输入”替换这一帧，并从 tStart 重算到 localTick
+    // 还原宝物到基线帧
+    if (this.itemsByTick[baseTick]) {
+      this.items = this.cloneItems(this.itemsByTick[baseTick]);
+    } else {
+      this.items = this.cloneItems(this.initialItemsSeed);
+    }
+
+    // 从 tStart 重算到当前帧
     for (let t = tStart; t <= this.localTick; t++) {
       const authoritative = this.inputsByTick[t];
       const used = authoritative
         ? authoritative
         : this.usedInputsByTick[t] || this.predictTableFor(t);
       this.usedInputsByTick[t] = this.cloneInputTable(used);
-      this.stepOneTick(t, used); // 内部会重建 eventsByTick[t] 与 stateByTick[t]
+      this.stepOneTick(t, used); // 内部会重建 events/state/items 的快照
     }
 
     this.renderFromState();
@@ -314,14 +377,20 @@ export class FrameSyncClient extends Component {
     const target = Math.max(0, this.serverTickLatest - this.PLAYBACK_DELAY + 1);
     this.localTick = target;
 
-    // 选择最近的状态快照作为基线（没有就用当前）
+    // 选择最近的状态/宝物快照作为基线（没有就用当前/初始）
     let nearest = 0;
     for (const k of Object.keys(this.stateByTick)) {
       const t = +k;
       if (t <= this.localTick && t > nearest) nearest = t;
     }
-    if (nearest > 0)
+    if (nearest > 0) {
       this.currentState = this.cloneState(this.stateByTick[nearest]);
+      this.items = this.cloneItems(
+        this.itemsByTick[nearest] || this.initialItemsSeed
+      );
+    } else {
+      this.items = this.cloneItems(this.initialItemsSeed);
+    }
 
     // 清理过期缓存
     for (const k of Object.keys(this.inputsByTick))
@@ -332,6 +401,8 @@ export class FrameSyncClient extends Component {
       if (+k < this.localTick) delete this.stateByTick[+k];
     for (const k of Object.keys(this.eventsByTick))
       if (+k < this.localTick) delete this.eventsByTick[+k];
+    for (const k of Object.keys(this.itemsByTick))
+      if (+k < this.localTick) delete this.itemsByTick[+k];
 
     this.predictedTicks.clear();
     this.acc = 0;
@@ -340,26 +411,50 @@ export class FrameSyncClient extends Component {
 
   // ==== 渲染 ====
   private renderFromState() {
+    // 玩家
     for (const [pidStr, pos] of Object.entries(this.currentState)) {
-      if (pidStr.startsWith("hp:")) continue; // 不把 hp:* 当节点
+      if (pidStr.startsWith("hp:") || pidStr.startsWith("score:")) continue; // 不把扩展键当节点
       const pid = Number(pidStr);
       this.ensurePlayer(pid);
       const n = this.players.get(pid)!;
       n.setPosition(new Vec3(pos.x, pos.y, 0));
     }
+
+    // 宝物（可选模板存在则显示/隐藏）
+    if (this.itemTemplate) {
+      for (const it of this.items) {
+        let n = this.itemNodes.get(it.id);
+        if (!n) {
+          n = instantiate(this.itemTemplate);
+          n.setParent(this.node);
+          this.itemNodes.set(it.id, n);
+        }
+        n.setPosition(new Vec3(it.x, it.y, 0));
+        n.active = it.alive;
+      }
+    }
   }
 
-  // 事件表现（这里先用 log；后续可替换成飘字/受击闪烁）
+  // 事件表现（这里先用 log；真正项目里替换成飘字/特效即可）
   private playFxForTick(tick: number, compressed: boolean) {
     const evs = this.eventsByTick[tick] || [];
     if (compressed) {
-      // 压缩：只对每个目标播放本帧最后一次 damage
-      const lastByTarget = new Map<string, GameEvent>();
-      for (const e of evs)
-        if (e.kind === "damage") lastByTarget.set(e.target, e);
-      for (const e of lastByTarget.values()) {
+      // 压缩：只保留每个目标“最后一次 damage”，以及每个 item 的“最后一次 pickup”
+      const lastDmgByTarget = new Map<string, GameEvent>();
+      const lastPickupByItem = new Map<string, GameEvent>();
+      for (const e of evs) {
+        if (e.kind === "damage") lastDmgByTarget.set(e.target, e);
+        else if (e.kind === "pickup") lastPickupByItem.set(e.itemId, e);
+      }
+      for (const e of lastDmgByTarget.values()) {
         const hp = (this.currentState[`hp:${e.target}`] as any) ?? 100;
         console.log(`[FX] dmg x${e.amount} to ${e.target} @${tick} → HP=${hp}`);
+      }
+      for (const e of lastPickupByItem.values()) {
+        const sc = (this.currentState[`score:${e.pid}`] as any) ?? 0;
+        console.log(
+          `[FX] pickup ${e.itemId} by ${e.pid} @${tick} → SCORE=${sc}`
+        );
       }
     } else {
       for (const e of evs)
@@ -367,6 +462,11 @@ export class FrameSyncClient extends Component {
           const hp = (this.currentState[`hp:${e.target}`] as any) ?? 100;
           console.log(
             `[FX] dmg ${e.amount} to ${e.target} @${tick} → HP=${hp}`
+          );
+        } else if (e.kind === "pickup") {
+          const sc = (this.currentState[`score:${e.pid}`] as any) ?? 0;
+          console.log(
+            `[FX] pickup ${e.itemId} by ${e.pid} @${tick} → SCORE=${sc}`
           );
         }
     }
@@ -398,6 +498,9 @@ export class FrameSyncClient extends Component {
   }
   private cloneInputTable(t: InputTable): InputTable {
     return JSON.parse(JSON.stringify(t || {}));
+  }
+  private cloneItems(items: Item[]): Item[] {
+    return JSON.parse(JSON.stringify(items || []));
   }
   private initialState(): StateTable {
     return {};
