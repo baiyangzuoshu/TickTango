@@ -611,6 +611,9 @@
     },
     "_enabled": true,
     "__prefab": null,
+    "box": {
+      "__id__": 10
+    },
     "_id": "4c4DC1n3lK874YWXmkhbNO"
   },
   {
