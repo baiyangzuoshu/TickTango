@@ -1,17 +1,21 @@
 import { WebSocketServer } from "ws";
 
-const wss = new WebSocketServer({ port: 8080 });
-console.log("WS on ws://localhost:8080");
+const PORT = 8080;
+const TICK_MS = 100; // 10Hz
+const wss = new WebSocketServer({ port: PORT });
+console.log(`WS on ws://localhost:${PORT}`);
 
 let nextPid = 1;
-const latestInputs = new Map(); // pid -> {x,y}
 let tick = 0;
-const TICK_MS = 100; // 10Hz
+// 仅保存“每个玩家最新输入”
+const latestInputs = new Map(); // pid:number -> {x:number,y:number}
 
 setInterval(() => {
   tick++;
-  const snapshot = Object.fromEntries(latestInputs); // 这一刻各玩家的输入快照
+  // 这一刻的输入快照
+  const snapshot = Object.fromEntries(latestInputs);
   const payload = JSON.stringify({ type: "tick", tick, inputs: snapshot });
+
   for (const c of wss.clients) if (c.readyState === 1) c.send(payload);
 }, TICK_MS);
 
